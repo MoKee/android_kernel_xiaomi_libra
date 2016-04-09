@@ -1,5 +1,4 @@
 /* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
- * Copyright (C) 2016 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -26,7 +25,6 @@
 #include <linux/workqueue.h>
 #include <linux/power_supply.h>
 #include "leds.h"
-#include <linux/qpnp/power-on.h>
 
 #define FLASH_LED_PERIPHERAL_SUBTYPE(base)			(base + 0x05)
 #define FLASH_SAFETY_TIMER(base)				(base + 0x40)
@@ -94,8 +92,8 @@
 #define	FLASH_LED_THERMAL_DEVIDER				10
 #define	FLASH_LED_VPH_DROOP_THRESHOLD_MIN_MV			2500
 #define	FLASH_LED_VPH_DROOP_THRESHOLD_DIVIDER			100
-#define	FLASH_LED_HDRM_SNS_ENABLE				0x81
-#define	FLASH_LED_HDRM_SNS_DISABLE				0x01
+#define FLASH_LED_HDRM_SNS_ENABLE				0x81
+#define FLASH_LED_HDRM_SNS_DISABLE				0x01
 #define	FLASH_LED_UA_PER_MA					1000
 #define	FLASH_LED_MASK_MODULE_MASK2_ENABLE			0x20
 #define	FLASH_LED_MASK3_ENABLE_SHIFT				7
@@ -185,6 +183,7 @@ struct flash_led_platform_data {
 	u16				vph_pwr_droop_threshold;
 	u16				headroom;
 	u16				clamp_current;
+	u16				duration;
 	u8				thermal_derate_threshold;
 	u8				vph_pwr_droop_debounce_time;
 	u8				startup_dly;
@@ -211,7 +210,6 @@ struct qpnp_flash_led {
 	struct pinctrl_state		*gpio_state_active;
 	struct pinctrl_state		*gpio_state_suspend;
 	struct workqueue_struct		*ordered_workq;
-	struct device_node		*pon_dev;
 	struct mutex			flash_led_lock;
 	int				num_leds;
 	u16				base;
@@ -388,7 +386,7 @@ static ssize_t qpnp_flash_led_max_current_show(struct device *dev,
 	struct qpnp_flash_led *led;
 	struct flash_node_data *flash_node;
 	struct led_classdev *led_cdev = dev_get_drvdata(dev);
-	int max_curr_avail_ma = 0;
+	int max_curr_avail_ma;
 	flash_node = container_of(led_cdev, struct flash_node_data, cdev);
 	led = dev_get_drvdata(&flash_node->spmi_dev->dev);
 
@@ -594,12 +592,6 @@ static int qpnp_flash_led_module_disable(struct qpnp_flash_led *led,
 				return -EINVAL;
 			}
 		}
-                rc = qpnp_pon_set_rb_spare(led->pon_dev, false);
-                if (rc) {
-                        dev_err(&led->spmi_dev->dev,
-                                "failed to set rb_spare\n");
-                        return -EINVAL;
-                }
 	}
 
 	if (flash_node->trigger & FLASH_LED0_TRIGGER) {
@@ -650,8 +642,11 @@ static int flash_regulator_parse_dt(struct qpnp_flash_led *led,
 					sizeof(struct flash_regulator_data *) *
 						flash_node->num_regulators,
 						GFP_KERNEL);
-	if (!flash_node->reg_data)
+	if (!flash_node->reg_data) {
+		dev_err(&led->spmi_dev->dev,
+				"Unable to allocate memory\n");
 		return -ENOMEM;
+	}
 
 	for_each_child_of_node(node, temp) {
 		rc = of_property_read_string(temp, "regulator-name",
@@ -796,12 +791,6 @@ static void qpnp_flash_led_work(struct work_struct *work)
 	}
 
 	if (flash_node->type == TORCH) {
-		rc = qpnp_pon_set_rb_spare(led->pon_dev, true);
-		if (rc) {
-			dev_err(&led->spmi_dev->dev,
-				"failed to set rb_spare\n");
-			goto exit_flash_led_work;
-		}
 		rc = qpnp_led_masked_write(led->spmi_dev,
 			FLASH_LED_UNLOCK_SECURE(led->base),
 			FLASH_SECURE_MASK, FLASH_UNLOCK_SECURE);
@@ -1064,7 +1053,7 @@ static void qpnp_flash_led_work(struct work_struct *work)
 			}
 		}
 
-		val = (u8)((flash_node->duration - FLASH_DURATION_DIVIDER)
+		val = (u8)((led->pdata->duration - FLASH_DURATION_DIVIDER)
 						/ FLASH_DURATION_DIVIDER);
 		rc = qpnp_led_masked_write(led->spmi_dev,
 			FLASH_SAFETY_TIMER(led->base),
@@ -1291,7 +1280,9 @@ static void qpnp_flash_led_brightness_set(struct led_classdev *led_cdev,
 		flash_node->prgm_current = value;
 	}
 
+	mutex_lock(&led->flash_led_lock);
 	queue_work(led->ordered_workq, &flash_node->work);
+	mutex_unlock(&led->flash_led_lock);
 
 	return;
 }
@@ -1450,6 +1441,30 @@ static int qpnp_flash_led_init_settings(struct qpnp_flash_led *led)
 		return rc;
 	}
 
+	if (led->pdata->hdrm_sns_ch0_en) {
+		rc = qpnp_led_masked_write(led->spmi_dev,
+				FLASH_HDRM_SNS_ENABLE_CTRL0(led->base),
+				FLASH_LED_HDRM_SNS_ENABLE_MASK,
+				FLASH_LED_HDRM_SNS_ENABLE);
+		if (rc) {
+			dev_err(&led->spmi_dev->dev,
+					"Headroom sense enable failed\n");
+			return rc;
+		}
+	}
+
+	if (led->pdata->hdrm_sns_ch1_en) {
+		rc = qpnp_led_masked_write(led->spmi_dev,
+				FLASH_HDRM_SNS_ENABLE_CTRL1(led->base),
+				FLASH_LED_HDRM_SNS_ENABLE_MASK,
+				FLASH_LED_HDRM_SNS_ENABLE);
+		if (rc) {
+			dev_err(&led->spmi_dev->dev,
+					"Headroom sense enable failed\n");
+			return rc;
+		}
+	}
+
 	led->battery_psy = power_supply_get_by_name("battery");
 	if (!led->battery_psy) {
 		dev_err(&led->spmi_dev->dev,
@@ -1496,14 +1511,6 @@ static int qpnp_flash_led_parse_each_led_dt(struct qpnp_flash_led *led,
 	} else if (rc != -EINVAL) {
 		dev_err(&led->spmi_dev->dev,
 				"Unable to read current\n");
-		return rc;
-	}
-
-	rc = of_property_read_u32(node, "qcom,duration", &val);
-	if (!rc)
-		flash_node->duration = (u16)val;
-	else if (rc != -EINVAL) {
-		dev_err(&led->spmi_dev->dev, "Unable to read duration\n");
 		return rc;
 	}
 
@@ -1577,6 +1584,15 @@ static int qpnp_flash_led_parse_common_dt(
 	} else if (rc != -EINVAL) {
 		dev_err(&led->spmi_dev->dev,
 					"Unable to read clamp current\n");
+		return rc;
+	}
+
+	rc = of_property_read_u32(node, "qcom,duration", &val);
+	if (!rc) {
+		led->pdata->duration = val;
+	} else if (rc != -EINVAL) {
+		dev_err(&led->spmi_dev->dev,
+					"unable to read duration\n");
 		return rc;
 	}
 
@@ -1895,9 +1911,6 @@ static int qpnp_flash_led_probe(struct spmi_device *spmi)
 	}
 
 	led->num_leds = i;
-	led->pon_dev = of_parse_phandle(node, "qcom,pon-dev", 0);
-	if (!led->pon_dev)
-		pr_err("No pon-dev specified!\n");
 
 	dev_set_drvdata(&spmi->dev, led);
 

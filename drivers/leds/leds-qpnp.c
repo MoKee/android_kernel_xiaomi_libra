@@ -1,6 +1,5 @@
 
 /* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
- * Copyright (C) 2016 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -27,6 +26,7 @@
 #include <linux/delay.h>
 #include <linux/regulator/consumer.h>
 #include <linux/delay.h>
+#include <linux/ctype.h>
 
 #define WLED_MOD_EN_REG(base, n)	(base + 0x60 + n*0x10)
 #define WLED_IDAC_DLY_REG(base, n)	(WLED_MOD_EN_REG(base, n) + 0x01)
@@ -184,9 +184,14 @@
 #define RGB_LED_SRC_MASK		0x03
 #define QPNP_LED_PWM_FLAGS	(PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP)
 #define QPNP_LUT_RAMP_STEP_DEFAULT	255
+#define QPNP_LUT_RAMP_STEP_MAX		255
+#define QPNP_LUT_RAMP_STEP_MIN		1
 #define	PWM_LUT_MAX_SIZE		63
 #define	PWM_GPLED_LUT_MAX_SIZE		31
 #define RGB_LED_DISABLE			0x00
+#define RGB_LED_MIN_MS			50
+#define RGB_LED_MAX_MS			10000
+#define RGB_LED_RAMP_STEP_COUNT	5
 
 #define MPP_MAX_LEVEL			LED_FULL
 #define LED_MPP_MODE_CTRL(base)		(base + 0x40)
@@ -503,6 +508,9 @@ struct kpdbl_config_data {
 struct rgb_config_data {
 	struct pwm_config_data	*pwm_cfg;
 	u8	enable;
+	u32	on_ms;
+	u32	off_ms;
+	u8	start;
 };
 
 /**
@@ -1727,12 +1735,78 @@ static int qpnp_kpdbl_set(struct qpnp_led_data *led)
 	return 0;
 }
 
+static int rgb_duration_config(struct qpnp_led_data *led)
+{
+	int rc = 0;
+	int i;
+	unsigned long on_ms = led->rgb_cfg->on_ms;
+	unsigned long off_ms = led->rgb_cfg->off_ms;
+	unsigned long ramp_step_ms, num_duty_pcts;
+	struct pwm_config_data  *pwm_cfg = led->rgb_cfg->pwm_cfg;
+
+	if (!on_ms) {
+		return -EINVAL;
+	} else if (!off_ms) {
+		/* implement always on
+		 * note:
+		 * rgb_on_off_ms_store() bumps on_ms=0 up to RGB_LED_MIN_MS
+		 * so setting ms on/off to 0/0 in /sys results in seeing
+		 * 50/0 by the time we get here
+		 */
+		ramp_step_ms = 1000;
+		num_duty_pcts = 1;
+		pwm_cfg->duty_cycles->duty_pcts[0] =
+			(led->cdev.brightness *
+			100) / RGB_MAX_LEVEL;
+	} else {
+		ramp_step_ms = on_ms / 20;
+		ramp_step_ms = (ramp_step_ms < 5)? 5 : ramp_step_ms;
+		num_duty_pcts = RGB_LED_RAMP_STEP_COUNT;
+
+		for (i = 0; i < num_duty_pcts; i++) {
+			pwm_cfg->duty_cycles->duty_pcts[i] =
+				(led->cdev.brightness * 25 *
+				(num_duty_pcts-i-1)) / RGB_MAX_LEVEL;
+		}
+	}
+
+	pwm_cfg->duty_cycles->num_duty_pcts = num_duty_pcts;
+	pwm_cfg->duty_cycles->start_idx = 0;
+	pwm_cfg->lut_params.ramp_step_ms = ramp_step_ms;
+	pwm_cfg->lut_params.start_idx = 0;
+	pwm_cfg->lut_params.idx_len = pwm_cfg->duty_cycles->num_duty_pcts;
+	if (on_ms > (ramp_step_ms*num_duty_pcts * 2))
+		pwm_cfg->lut_params.lut_pause_lo =
+				on_ms - (ramp_step_ms * num_duty_pcts * 2);
+	else
+		pwm_cfg->lut_params.lut_pause_lo = 0;
+	pwm_cfg->lut_params.lut_pause_hi = off_ms;
+	pwm_cfg->lut_params.flags = PM_PWM_LUT_RAMP_UP;
+	if (pwm_cfg->lut_params.lut_pause_lo)
+		pwm_cfg->lut_params.flags |= PM_PWM_LUT_PAUSE_LO_EN;
+	if (pwm_cfg->lut_params.lut_pause_hi)
+		pwm_cfg->lut_params.flags |= PM_PWM_LUT_PAUSE_HI_EN |
+				PM_PWM_LUT_LOOP | PM_PWM_LUT_REVERSE;
+
+	rc = pwm_lut_config(pwm_cfg->pwm_dev,
+				pwm_cfg->pwm_period_us,
+				pwm_cfg->duty_cycles->duty_pcts,
+				pwm_cfg->lut_params);
+
+	if (rc < 0) {
+		dev_err(&led->spmi_dev->dev, "Failed to configure pwm LUT\n");
+		return rc;
+	}
+
+	return 0;
+}
+
 static int qpnp_rgb_set(struct qpnp_led_data *led)
 {
 	int rc;
 	int duty_us, duty_ns, period_us;
 
-	if (led->cdev.brightness) {
+	if (led->cdev.brightness && led->rgb_cfg->start) {
 		if (!led->rgb_cfg->pwm_cfg->blinking)
 			led->rgb_cfg->pwm_cfg->mode =
 				led->rgb_cfg->pwm_cfg->default_mode;
@@ -1759,6 +1833,10 @@ static int qpnp_rgb_set(struct qpnp_led_data *led)
 				return rc;
 			}
 		}
+		else if (led->rgb_cfg->pwm_cfg->mode == LPG_MODE) {
+			rgb_duration_config(led);
+		}
+
 		rc = qpnp_led_masked_write(led,
 			RGB_LED_EN_CTL(led->base),
 			led->rgb_cfg->enable, led->rgb_cfg->enable);
@@ -1845,10 +1923,6 @@ static void __qpnp_led_work(struct qpnp_led_data *led,
 	case QPNP_ID_RGB_RED:
 	case QPNP_ID_RGB_GREEN:
 	case QPNP_ID_RGB_BLUE:
-		rc = qpnp_rgb_set(led);
-		if (rc < 0)
-			dev_err(&led->spmi_dev->dev,
-				"RGB set brightness failed (%d)\n", rc);
 		break;
 	case QPNP_ID_LED_MPP:
 		rc = qpnp_mpp_set(led);
@@ -2613,6 +2687,8 @@ restore:
 static void led_blink(struct qpnp_led_data *led,
 			struct pwm_config_data *pwm_cfg)
 {
+	int rc;
+
 	flush_work(&led->work);
 	mutex_lock(&led->lock);
 	if (pwm_cfg->use_blink) {
@@ -2634,15 +2710,27 @@ static void led_blink(struct qpnp_led_data *led,
 		}
 		pwm_free(pwm_cfg->pwm_dev);
 		qpnp_pwm_init(pwm_cfg, led->spmi_dev, led->cdev.name);
-		mutex_unlock(&led->lock);
-		if (led->in_order_command_processing)
-			queue_work(led->workqueue, &led->work);
-		else
-			schedule_work(&led->work);
-	} else {
-		mutex_unlock(&led->lock);
+		if (led->id == QPNP_ID_RGB_RED || led->id == QPNP_ID_RGB_GREEN
+				|| led->id == QPNP_ID_RGB_BLUE) {
+			rc = qpnp_rgb_set(led);
+			if (rc < 0)
+				dev_err(&led->spmi_dev->dev,
+				"RGB set brightness failed (%d)\n", rc);
+		} else if (led->id == QPNP_ID_LED_MPP) {
+			rc = qpnp_mpp_set(led);
+			if (rc < 0)
+				dev_err(&led->spmi_dev->dev,
+				"MPP set brightness failed (%d)\n", rc);
+		} else if (led->id == QPNP_ID_KPDBL) {
+			rc = qpnp_kpdbl_set(led);
+			if (rc < 0)
+				dev_err(&led->spmi_dev->dev,
+				"KPDBL set brightness failed (%d)\n", rc);
+		}
 	}
+	mutex_unlock(&led->lock);
 }
+
 static unsigned int s_blink;
 static ssize_t blink_store(struct device *dev,
 	struct device_attribute *attr,
@@ -2679,6 +2767,103 @@ static ssize_t blink_store(struct device *dev,
 	return count;
 }
 
+static ssize_t rgb_on_off_ms_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led_cdev = dev_get_drvdata(dev);
+	struct qpnp_led_data *led =
+			container_of(led_cdev, struct qpnp_led_data, cdev);
+
+	return sprintf(buf, "%d %d\n",
+			led->rgb_cfg->on_ms, led->rgb_cfg->off_ms);
+}
+
+static ssize_t rgb_on_off_ms_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct led_classdev *led_cdev = dev_get_drvdata(dev);
+	struct qpnp_led_data *led =
+			container_of(led_cdev, struct qpnp_led_data, cdev);
+	int on_ms;
+	int off_ms;
+
+	sscanf(buf, "%d %d", &on_ms, &off_ms);
+
+	if (on_ms < RGB_LED_MIN_MS)
+		on_ms = RGB_LED_MIN_MS;
+	if (on_ms > RGB_LED_MAX_MS)
+		on_ms = RGB_LED_MAX_MS;
+	if (off_ms > RGB_LED_MAX_MS)
+		off_ms = RGB_LED_MAX_MS;
+
+	if (on_ms == led->rgb_cfg->on_ms && off_ms == led->rgb_cfg->off_ms)
+		return size;
+
+	led->rgb_cfg->on_ms = on_ms;
+	led->rgb_cfg->off_ms = off_ms;
+
+	return size;
+}
+
+static ssize_t rgb_start_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *led_cdev = dev_get_drvdata(dev);
+	struct qpnp_led_data *led =
+			container_of(led_cdev, struct qpnp_led_data, cdev);
+
+	return sprintf(buf, "%d\n", led->rgb_cfg->start);
+}
+
+static ssize_t rgb_start_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct led_classdev *led_cdev = dev_get_drvdata(dev);
+	struct qpnp_led_data *led =
+			container_of(led_cdev, struct qpnp_led_data, cdev);
+	int ret = -EINVAL;
+	char *after;
+	unsigned long state = simple_strtoul(buf, &after, 10);
+	size_t count = after - buf;
+	struct qpnp_led_data *led_array;
+	int i;
+
+	if (isspace(*after))
+		count++;
+
+	if (count != size)
+		return -EINVAL;
+
+	if (led->rgb_cfg->start == (u8)state)
+		return count;
+
+	led_array = dev_get_drvdata(&led->spmi_dev->dev);
+
+	for (i = 0; i < led_array->num_leds; i++) {
+		switch (led_array[i].id) {
+		case QPNP_ID_RGB_RED:
+		case QPNP_ID_RGB_GREEN:
+		case QPNP_ID_RGB_BLUE:
+			if (led_array[i].rgb_cfg->start == (u8)state)
+				break;
+
+			led_array[i].rgb_cfg->start = (u8)state;
+			ret = qpnp_rgb_set(&led_array[i]);
+			if (ret < 0)
+				dev_err(led_array[i].cdev.dev,
+					"RGB set rgb start failed (%d)\n", ret);
+			if (!(led_array[i].rgb_cfg->pwm_cfg->lut_params.flags &
+							PM_PWM_LUT_RAMP_UP))
+				led_array[i].rgb_cfg->start = 0;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return count;
+}
+
 static ssize_t blink_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -2695,6 +2880,8 @@ static DEVICE_ATTR(ramp_step_ms, 0664, NULL, ramp_step_ms_store);
 static DEVICE_ATTR(lut_flags, 0664, NULL, lut_flags_store);
 static DEVICE_ATTR(duty_pcts, 0664, NULL, duty_pcts_store);
 static DEVICE_ATTR(blink, 0664, blink_show, blink_store);
+static DEVICE_ATTR(on_off_ms, 0644, rgb_on_off_ms_show, rgb_on_off_ms_store);
+static DEVICE_ATTR(rgb_start, 0644, rgb_start_show, rgb_start_store);
 
 static struct attribute *led_attrs[] = {
 	&dev_attr_led_mode.attr,
@@ -2718,6 +2905,8 @@ static struct attribute *lpg_attrs[] = {
 	&dev_attr_ramp_step_ms.attr,
 	&dev_attr_lut_flags.attr,
 	&dev_attr_duty_pcts.attr,
+	&dev_attr_on_off_ms.attr,
+	&dev_attr_rgb_start.attr,
 	NULL
 };
 
